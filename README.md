@@ -17,14 +17,165 @@ Use the ***Deploy to Azure*** button above to deploy out an Azure App Service al
 ## Passthrough Application Settings
 You can set SonarQube sonar.properties settings based on the Azure application settings. Anything prefixed with sonar.* will at runtime be set in sonar.properties file if it matches a property there. This enables settings to be defined in the ARM template and set at runtime.
 
-> Note: All entries in the sonar.properties file are commented out by the [HttpPlatformHandlerStartup](wwwroot/HttpPlatformHandlerStartup.ps1) script on startup. To change the Sonar properties add the application settings entry in the configuration blade (e.g. Name = sonar.jdbc.password; Value = XXXXX).
+> Note: All entries in the sonar.properties file are commented out by the [HttpPlatformHandlerStartup](**Code Below**) script on startup. To change the Sonar properties add the application settings entry in the configuration blade (e.g. Name = sonar.jdbc.password; Value = XXXXX).
+```
+param(
+    [string]$ApplicationInsightsApiKey = $Env:Deployment_Telemetry_Instrumentation_Key
+)
+
+function log($message) {
+    [DateTime]$dateTime = [System.DateTime]::Now
+    Write-Output "$($dateTime.ToLongTimeString()) $message"
+}
+
+function TrackEvent {
+    param (
+        [string]$InstrumentationKey,
+        [string]$EventName
+    )
+
+    log($EventName)
+    if ($InstrumentationKey) {
+        $uniqueId = ''
+        if ($Env:WEBSITE_INSTANCE_ID) {
+            $uniqueId = $Env:WEBSITE_INSTANCE_ID.substring(5, 15)
+        }
+
+        $properties = @{
+            "Location"        = $Env:REGION_NAME;
+            "SKU"             = $Env:WEBSITE_SKU;
+            "Processor Count" = $Env:NUMBER_OF_PROCESSORS;
+            "Always On"       = $Env:WEBSITE_SCM_ALWAYS_ON_ENABLED;
+            "UID"             = $uniqueId
+        }
+
+        $body = ConvertTo-Json -Depth 5 -InputObject @{
+            name = "Microsoft.ApplicationInsights.Dev.$InstrumentationKey.Event";
+            time = [Datetime]::UtcNow.ToString("yyyy-MM-dd HH:mm:ss");
+            iKey = $InstrumentationKey;
+            data = @{
+                baseType = "EventData";
+                baseData = @{
+                    ver        = 2;
+                    name       = $EventName;
+                    properties = $properties;
+                }
+            };
+        }
+
+        Invoke-RestMethod -Method POST -Uri "https://dc.services.visualstudio.com/v2/track" -ContentType "application/json" -Body $body | out-null
+    }
+}
+
+function Set-Property-Value {
+    param (
+        [string]$ConfigContent,
+        [string]$PropertyName,
+        [string]$PropertyValue
+    )
+
+    if ($PropertyName -eq "sonar.jdbc.url") {
+        $dbDriver = $PropertyValue | Select-String -Pattern '^jdbc:([^:]*):' | % { $_.matches.groups[0] }
+        [regex]$pattern = "(?m)^#?$([regex]::Escape($PropertyName))=$([regex]::Escape($dbDriver)).*"
+        $ConfigContent = $pattern.replace($ConfigContent, "$propertyName=$propertyValue", 1)
+    }
+    else {
+        [regex]$pattern = "(?m)^#?$([regex]::Escape($PropertyName))=.*"
+        $ConfigContent = $pattern.replace($ConfigContent, "$propertyName=$propertyValue", 1)
+    }
+
+    return $ConfigContent;
+}
+
+TrackEvent -InstrumentationKey $ApplicationInsightsApiKey -EventName 'Starting HttpPlatformHandler Script'
+
+log('Searching for sonar.properties file')
+$propFile = Get-ChildItem 'sonar.properties' -Recurse
+if (!$propFile) {
+    log('Could not find sonar.properties')
+    exit
+}
+log("File found at: $($propFile.FullName)")
+$configContents = Get-Content -Path $propFile.FullName -Raw
+
+log('Resetting properties.')
+$configContents = $configContents -ireplace '(?m)^#?sonar\.', '#sonar.'
+
+log('Updating sonar.properties based on environment/application settings.')
+Get-ChildItem Env: | Where-Object -Property Name -like -Value 'sonar.*' | ForEach-Object {
+    $propertyName = $_.Name
+    $propertyValue = $_.Value
+    log("Setting $propertyName to ***VALUE HIDDEN***")
+    $configContents = Set-Property-Value $configContents $propertyName $propertyValue
+}
+
+$port = $Env:HTTP_PLATFORM_PORT
+log("HTTP_PLATFORM_PORT is: $port")
+log("Updating sonar.web.port to $port")
+$configContents = $configContents -ireplace '(?m)^#?sonar\.web\.port=.*', "sonar.web.port=$port"
+
+log('Saving updated sonar.properties contents')
+$configContents.Trim() | Out-String | Set-Content -Path $propFile.FullName -NoNewLine
+
+$sqver = $propFile.FullName.split("\")[4].split("-")[1]
+log("SQ version: $sqver")
+if ([version]$sqver -ge [version]9.6) {
+    log("SQ ver >= 9.6, use env var not wrapper.conf")
+    $Env:SONAR_JAVA_PATH = "$Env:JAVA_HOME\bin\java.exe"
+    log("Set Java exe path env var (SONAR_JAVA_PATH) to: $Env:SONAR_JAVA_PATH")
+}
+else {
+    log('SQ ver < 9.6, use wrapper.conf')
+    log('Searching for wrapper.conf file')
+    $wrapperConfig = Get-ChildItem 'wrapper.conf' -Recurse
+    if (!$wrapperConfig) {
+        log("Could not find wrapper.conf")
+        exit
+    }
+    else {
+        log("File found at: $($wrapperConfig.FullName)")
+        log('Updating wrapper.conf based on environment/application settings.')
+        $wrapperConfigContents = Get-Content -Path $wrapperConfig.FullName -Raw
+        $wrapperConfigContents -ireplace 'wrapper\.java\.command=.*', 'wrapper.java.command=%JAVA_HOME%\bin\java' | Set-Content -Path $wrapperConfig.FullName -NoNewLine
+    }
+}
+
+log('Searching for duplicate plugins.')
+$plugins = Get-ChildItem '.\sonarqube-*\extensions\plugins\*' -Filter '*.jar'
+$pluginBaseName = $plugins | ForEach-Object { $_.Name.substring(0, $_.Name.LastIndexOf('-')) }
+$uniquePlugins = $pluginBaseName | Select-Object -Unique
+if ($uniquePlugins) {
+    $duplicates = Compare-Object -ReferenceObject $uniquePlugins -DifferenceObject $pluginBaseName
+    if ($duplicates) {
+        log("Duplicates plugins found for: $($duplicates.InputObject)")a
+        foreach ($duplicate in $duplicates) {
+            $oldestFile = $plugins | Where-Object { $_.Name -imatch $duplicate.InputObject } | Sort-Object -Property 'LastWriteTime' | Select-Object -First 1
+            log("Deleting $oldestFile")
+            $oldestFile | Remove-Item
+        }
+    }
+}
+
+log('Searching for StartSonar.bat')
+$startScript = Get-ChildItem 'StartSonar.bat' -Recurse
+if (!$startScript) {
+    log('Could not find StartSonar.bat')
+    exit
+}
+
+log("File found at: $($startScript[-1].FullName)")
+log('Executing StartSonar.bat')
+& $startScript[-1].FullName
+
+TrackEvent -InstrumentationKey $ApplicationInsightsApiKey -EventName 'Exiting HttpPlatformHandler Script'
+```
 
 ## In-Depth Details
 After the ARM template is deployed a deployment script is executed to copy the wwwroot folder from the repository folder to the App Service wwwroot folder. It also finds the most recent release of SonarQube to download and extract into the App Service wwwroot folder.
 
 The runtime execution is made possible by the [HttpPlatformHandler](https://docs.microsoft.com/en-us/iis/extensions/httpplatformhandler/httpplatformhandler-configuration-reference). This extension will start any executable and forward requests it receives onto the port defined in HTTP\_PLATFORM\_PORT environment variable. This port is randomly chosen at each invocation. A web.config file is used to tell the HttpPlatformHandler which file to execute and what parameters to pass along to the executing file.
 
- In order to make this work the [HttpPlatformHandlerStartup.ps1](https://github.com/vanderby/SonarQube-AzureAppService/blob/master/HttpPlatformHandlerStartup.ps1) script is executed by the HttpPlatformHandler. The script searches for the sonar.properties file and writes the port defined in the HTTP\_PLATFORM\_PORT environment variable to the properties file. It also writes the java.exe location to the wrapper.conf file. Finally it executes one of the StartSonar.bat file to start SonarQube.
+ In order to make this work the HttpPlatformHandlerStartup.ps1 script is executed by the HttpPlatformHandler. The script searches for the sonar.properties file and writes the port defined in the HTTP\_PLATFORM\_PORT environment variable to the properties file. It also writes the java.exe location to the wrapper.conf file. Finally it executes one of the StartSonar.bat file to start SonarQube.
 
 ### Logs cleanup web job
 After installation, web app would be provided with logs cleanup web job, which would be removing all the logs older than 1 day (or value, specified in `LogsToKeep` app settings variable)
@@ -43,7 +194,7 @@ If you wish to switch SQ to use an Azure SQL database deploy out the database wi
 1. Set application setting `SonarQubeOldVersion` to currently deployed version
 1. Set application setting `SonarQubeVersion` to new version to be deployed
 1. Stop web app
-1. Download new zip archive by executing following scripts at Kudu (in most cases it is https://YOUR-WEB-APP-NAME.scm.azurewebsites.net/DebugConsole/?shell=powershell): 
+1. Download new zip archive by executing following scripts at Kudu (in most cases it is https://kforce.scm.azurewebsites.net/DebugConsole/?shell=powershell): 
 ```
     $Edition = $Env:SonarQubeEdition
     $Version = $Env:SonarQubeVersion
